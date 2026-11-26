@@ -1,4 +1,6 @@
-import asyncio, ctypes, os, json, queue, re, shutil, subprocess, tempfile, threading, time, webbrowser, datetime, winreg, sys, base64, io
+import asyncio, ctypes, os, json, queue, re, shutil, subprocess, tempfile, threading, time, webbrowser, datetime, winreg, sys, base64, io, sqlite3, hashlib, secrets, socket
+import urllib.parse, urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -50,6 +52,9 @@ PERSONA = ("Você é a Capri, uma assistente virtual simpática que controla o c
 HOME = Path.home()
 CONFIG = HOME / "capri_config.json"
 MEMORIA = HOME / "capri_memoria.json"
+HISTORICO_DB = HOME / "capri_historico.db"
+GOOGLE_TOKEN = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO = "https://www.googleapis.com/oauth2/v3/userinfo"
 PASTAS = {"desktop": HOME / "Desktop", "downloads": HOME / "Downloads",
           "documentos": HOME / "Documents", "imagens": HOME / "Pictures",
           "musicas": HOME / "Music", "videos": HOME / "Videos"}
@@ -299,6 +304,87 @@ def carregar_memoria():
 
 def salvar_memoria(itens):
     MEMORIA.write_text(json.dumps(itens[-40:], ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def db():
+    con = sqlite3.connect(HISTORICO_DB)
+    con.row_factory = sqlite3.Row
+    con.execute("""CREATE TABLE IF NOT EXISTS contas (
+        id INTEGER PRIMARY KEY,
+        email TEXT UNIQUE NOT NULL,
+        nome TEXT,
+        google_sub TEXT,
+        criado_em TEXT)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS conversas (
+        id INTEGER PRIMARY KEY,
+        conta_id INTEGER NOT NULL,
+        titulo TEXT,
+        criada_em TEXT)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS mensagens (
+        id INTEGER PRIMARY KEY,
+        conversa_id INTEGER NOT NULL,
+        papel TEXT NOT NULL,
+        texto TEXT NOT NULL,
+        criada_em TEXT)""")
+    con.commit()
+    return con
+
+
+def conta_local():
+    with db() as con:
+        row = con.execute("SELECT id FROM contas WHERE email = ?", ("local@capri",)).fetchone()
+        if row:
+            return row["id"]
+        agora = datetime.datetime.now().isoformat(timespec="seconds")
+        cur = con.execute("INSERT INTO contas (email, nome, criado_em) VALUES (?, ?, ?)",
+                          ("local@capri", "Neste computador", agora))
+        return cur.lastrowid
+
+
+def conta_google(email, nome, sub):
+    agora = datetime.datetime.now().isoformat(timespec="seconds")
+    with db() as con:
+        con.execute("""INSERT INTO contas (email, nome, google_sub, criado_em)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(email) DO UPDATE SET nome = excluded.nome,
+                       google_sub = excluded.google_sub""",
+                    (email, nome or email, sub, agora))
+        return con.execute("SELECT id FROM contas WHERE email = ?", (email,)).fetchone()["id"]
+
+
+def nova_conversa(conta_id, titulo="Nova conversa"):
+    agora = datetime.datetime.now().isoformat(timespec="seconds")
+    with db() as con:
+        cur = con.execute("INSERT INTO conversas (conta_id, titulo, criada_em) VALUES (?, ?, ?)",
+                          (conta_id, titulo, agora))
+        return cur.lastrowid
+
+
+def gravar_mensagem(conversa_id, papel, texto):
+    if not conversa_id:
+        return
+    agora = datetime.datetime.now().isoformat(timespec="seconds")
+    with db() as con:
+        n = con.execute("SELECT COUNT(*) AS n FROM mensagens WHERE conversa_id = ?",
+                        (conversa_id,)).fetchone()["n"]
+        con.execute("INSERT INTO mensagens (conversa_id, papel, texto, criada_em) VALUES (?, ?, ?, ?)",
+                    (conversa_id, papel, texto, agora))
+        if n == 0 and papel == "user":
+            con.execute("UPDATE conversas SET titulo = ? WHERE id = ?", (texto[:80], conversa_id))
+
+
+def listar_conversas(conta_id):
+    with db() as con:
+        return [(r["id"], r["titulo"], r["criada_em"]) for r in con.execute(
+            """SELECT id, titulo, criada_em FROM conversas
+               WHERE conta_id = ? ORDER BY id DESC LIMIT 40""", (conta_id,))]
+
+
+def ler_mensagens(conversa_id):
+    with db() as con:
+        return [(r["papel"], r["texto"]) for r in con.execute(
+            """SELECT papel, texto FROM mensagens
+               WHERE conversa_id = ? ORDER BY id""", (conversa_id,))]
 
 
 def criar_atalho_desktop():
@@ -581,6 +667,10 @@ class App(ctk.CTk):
         self.geometry("860x780")
         self.fila = queue.Queue()
         self.historico = []
+        self.conta_id = None
+        self.conversa_id = None
+        self.email_conta = ""
+        self._sem_gravar = False
         self.ocupado = False
         self.voz_on = True
         self.client = None
@@ -663,10 +753,11 @@ class App(ctk.CTk):
                       command=self.enviar).grid(row=0, column=2, padx=(8, 0))
 
         self.bind("<Configure>", self._ao_redimensionar, add="+")
-        self.add("Capri", f"Oi, eu sou a Capri, criada por {self.criador}. Posso abrir programas, mexer nas "
-                          "configurações do Windows, controlar mouse e teclado e ver a sua tela. "
-                          "Antes de qualquer coisa arriscada, eu peço a sua permissão.\n\n"
-                          "Para me chamar de qualquer lugar, aperte Ctrl + Alt + C.")
+        try:
+            self._abrir_conta_salva()
+        except Exception:
+            self.conversa_id = None
+            self.add("Capri", "Abri sem o histórico. Dá para conversar normalmente.")
         self.after(60, self._tick_mascote)
         self.after(400, self._definir_icone)
         self.after(300, self.iniciar)
@@ -933,8 +1024,221 @@ class App(ctk.CTk):
         return tk.Menu(self, tearoff=0, bg=MARGEM, fg=TEXTO, activebackground=PELAGEM,
                        activeforeground=TEXTO, bd=0, relief="flat", font=(FONTE_UI, 11))
 
+    def _abrir_conta_salva(self):
+        cfg = ler_config()
+        self.conta_id = cfg.get("conta_id") or conta_local()
+        self.email_conta = cfg.get("email_conta") or ""
+        cid = cfg.get("conversa_id")
+        msgs = []
+        if cid:
+            try:
+                msgs = ler_mensagens(cid)
+            except Exception:
+                msgs = []
+        if msgs:
+            self.conversa_id = cid
+            self._sem_gravar = True
+            self.historico = []
+            for papel, texto in msgs:
+                quem = "Você" if papel == "user" else "Capri"
+                self.add(quem, texto)
+                if papel in ("user", "assistant"):
+                    self.historico.append({"role": papel, "content": texto})
+            self._sem_gravar = False
+        else:
+            self.conversa_id = nova_conversa(self.conta_id)
+            salvar_config(conta_id=self.conta_id, conversa_id=self.conversa_id)
+            self._ola()
+        if self.email_conta:
+            self.status.configure(text=self.email_conta)
+
+    def _ola(self):
+        extra = f" Conta: {self.email_conta}." if self.email_conta else ""
+        self.add("Capri", f"Oi, eu sou a Capri, criada por {self.criador}.{extra} "
+                          "Posso abrir programas, mexer nas configurações do Windows, "
+                          "controlar mouse e teclado e ver a sua tela. "
+                          "Antes de qualquer coisa arriscada, eu peço a sua permissão.\n\n"
+                          "Para me chamar de qualquer lugar, aperte Ctrl + Alt + C. "
+                          "As conversas ficam salvas no histórico.")
+
+    def começar_conversa(self):
+        if not self.conta_id:
+            self.conta_id = conta_local()
+        self.conversa_id = nova_conversa(self.conta_id)
+        salvar_config(conta_id=self.conta_id, conversa_id=self.conversa_id)
+        self.historico = []
+        self._sem_gravar = True
+        for w in self.chat.winfo_children():
+            w.destroy()
+        self.msgs_labels.clear()
+        self._sem_gravar = False
+        self._ola()
+
+    def entrar_google(self):
+        cfg = ler_config()
+        client_id = cfg.get("google_client_id") or ""
+        if not client_id:
+            d = ctk.CTkInputDialog(
+                text="Cole o Client ID do Google (ou o JSON do tipo Computador):",
+                title="Entrar com Google")
+            colado = (d.get_input() or "").strip()
+            if not colado:
+                return
+            secret = ""
+            if colado.startswith("{"):
+                try:
+                    dados = json.loads(colado)
+                    bloco = dados.get("installed") or dados.get("web") or dados
+                    client_id = bloco.get("client_id", "")
+                    secret = bloco.get("client_secret", "")
+                except Exception:
+                    self.add("Capri", "Esse texto não é um JSON válido do Google Cloud.")
+                    return
+            else:
+                client_id = colado
+            if not client_id:
+                self.add("Capri", "Não achei o Client ID.")
+                return
+            salvar_config(google_client_id=client_id, google_client_secret=secret)
+        self.status.configure(text="Abrindo o Google no navegador...")
+        threading.Thread(target=self._oauth_google, daemon=True).start()
+
+    def _oauth_google(self):
+        cfg = ler_config()
+        client_id = cfg.get("google_client_id", "")
+        secret = cfg.get("google_client_secret") or ""
+        verifier = secrets.token_urlsafe(64)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        porta = None
+        try:
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                porta = s.getsockname()[1]
+        except Exception as erro:
+            self.fila.put(("add", "Capri", f"Não consegui abrir a porta local: {erro}"))
+            return
+        redirect = f"http://127.0.0.1:{porta}"
+        estado = secrets.token_urlsafe(16)
+        url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
+            "client_id": client_id, "redirect_uri": redirect, "response_type": "code",
+            "scope": "openid email profile", "code_challenge": challenge,
+            "code_challenge_method": "S256", "state": estado, "access_type": "online",
+            "prompt": "select_account"})
+        codigo = {"v": None, "erro": None}
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                if q.get("state", [""])[0] != estado:
+                    codigo["erro"] = "estado inválido"
+                else:
+                    codigo["v"] = q.get("code", [None])[0]
+                    codigo["erro"] = q.get("error", [None])[0]
+                corpo = ("<html><body><p>Pode voltar para a Capri.</p></body></html>").encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(corpo)))
+                self.end_headers()
+                self.wfile.write(corpo)
+            def log_message(self, *a):
+                return
+
+        try:
+            httpd = HTTPServer(("127.0.0.1", porta), H)
+            httpd.timeout = 180
+            webbrowser.open(url)
+            httpd.handle_request()
+            httpd.server_close()
+        except Exception as erro:
+            self.fila.put(("add", "Capri", f"O login do Google falhou: {erro}"))
+            return
+        if not codigo["v"]:
+            self.fila.put(("add", "Capri", "Login cancelado." if not codigo["erro"] else f"Google: {codigo['erro']}"))
+            self.fila.put(("status", ""))
+            return
+        form = {"code": codigo["v"], "client_id": client_id, "redirect_uri": redirect,
+                "grant_type": "authorization_code", "code_verifier": verifier}
+        if secret:
+            form["client_secret"] = secret
+        try:
+            req = urllib.request.Request(GOOGLE_TOKEN, urllib.parse.urlencode(form).encode(),
+                                         {"Content-Type": "application/x-www-form-urlencoded"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                tok = json.loads(r.read().decode())
+            req = urllib.request.Request(GOOGLE_USERINFO, headers={"Authorization": "Bearer " + tok["access_token"]})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                info = json.loads(r.read().decode())
+        except Exception as erro:
+            self.fila.put(("add", "Capri", f"Não consegui confirmar a conta Google: {erro}"))
+            self.fila.put(("status", ""))
+            return
+        email = info.get("email") or ""
+        if not email:
+            self.fila.put(("add", "Capri", "O Google não devolveu o e-mail."))
+            return
+        self.fila.put(("google", email, info.get("name") or email, info.get("sub") or ""))
+
+    def _aplicar_google(self, email, nome, sub):
+        self.conta_id = conta_google(email, nome, sub)
+        self.email_conta = email
+        self.conversa_id = nova_conversa(self.conta_id)
+        salvar_config(conta_id=self.conta_id, email_conta=email, conversa_id=self.conversa_id)
+        self.historico = []
+        self._sem_gravar = True
+        for w in self.chat.winfo_children():
+            w.destroy()
+        self.msgs_labels.clear()
+        self._sem_gravar = False
+        self.status.configure(text=email)
+        self.add("Capri", f"Entrei com {email}. Se era a primeira vez, a conta ficou registrada na Capri. "
+                          "O histórico desta conta fica na tabela de conversas.")
+
+    def abrir_historico(self):
+        if not self.conta_id:
+            self.conta_id = conta_local()
+        janela = ctk.CTkToplevel(self)
+        janela.title("Histórico")
+        janela.geometry("420x480")
+        janela.configure(fg_color=FUNDO)
+        ctk.CTkLabel(janela, text="Conversas salvas", font=(FONTE_UI, 16, "bold"),
+                     text_color=TEXTO).pack(anchor="w", padx=16, pady=(14, 6))
+        lista = ctk.CTkScrollableFrame(janela, fg_color=FUNDO)
+        lista.pack(fill="both", expand=True, padx=10, pady=(0, 12))
+        linhas = listar_conversas(self.conta_id)
+        if not linhas:
+            ctk.CTkLabel(lista, text="Nenhuma conversa ainda.", text_color=SUAVE).pack(anchor="w", padx=8, pady=8)
+            return
+        for cid, titulo, _quando in linhas:
+            ctk.CTkButton(lista, text=(titulo or "Conversa")[:70], anchor="w", fg_color=MARGEM, hover_color=LINHA,
+                          text_color=TEXTO, command=lambda i=cid, j=janela: self._carregar_conversa(i, j)
+                          ).pack(fill="x", padx=6, pady=4)
+
+    def _carregar_conversa(self, conversa_id, janela):
+        msgs = ler_mensagens(conversa_id)
+        self.conversa_id = conversa_id
+        salvar_config(conversa_id=conversa_id, conta_id=self.conta_id)
+        self.historico = []
+        self._sem_gravar = True
+        for w in self.chat.winfo_children():
+            w.destroy()
+        self.msgs_labels.clear()
+        for papel, texto in msgs:
+            quem = "Você" if papel == "user" else "Capri"
+            self.add(quem, texto)
+            if papel in ("user", "assistant"):
+                self.historico.append({"role": papel, "content": texto})
+        self._sem_gravar = False
+        try:
+            janela.destroy()
+        except Exception:
+            pass
+
     def menu_mais(self):
         m = self._estilo_menu()
+        m.add_command(label="  Entrar com Google  ", command=self.entrar_google)
+        m.add_command(label="  Criar conta Google  ", command=lambda: webbrowser.open("https://accounts.google.com/signup"))
+        m.add_command(label="  Histórico  ", command=self.abrir_historico)
+        m.add_command(label="  Nova conversa  ", command=self.começar_conversa)
         m.add_command(label="  Criar atalho na Área de Trabalho  ", command=self.fazer_atalho)
         m.add_command(label="  Trocar a chave da API  ", command=self.pedir_chave)
         m.add_command(label="  Mudar o nome do criador  ", command=self.mudar_criador)
@@ -961,6 +1265,12 @@ class App(ctk.CTk):
     # ---------- tela ----------
     def add(self, quem, texto):
         texto = str(texto)
+        if not self._sem_gravar and quem in ("Você", "Capri") and self.conversa_id:
+            papel = "user" if quem == "Você" else "assistant"
+            try:
+                gravar_mensagem(self.conversa_id, papel, texto)
+            except Exception:
+                pass
         linha = ctk.CTkFrame(self.chat, fg_color="transparent")
         linha.pack(fill="x", padx=14, pady=(2, 7))
         bolha = None
@@ -1005,6 +1315,8 @@ class App(ctk.CTk):
                     self.atualizar_indicador()
                 elif item[0] == "frente":
                     self.trazer_frente()
+                elif item[0] == "google":
+                    self._aplicar_google(item[1], item[2], item[3])
                 elif item[0] == "confirmar":
                     self.lift()
                     item[3]["ok"] = messagebox.askyesno("A Capri pede permissão", item[1], parent=self)
